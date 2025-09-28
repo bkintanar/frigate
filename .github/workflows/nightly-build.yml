@@ -1,0 +1,141 @@
+name: Nightly Build - Frigate Dev
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC (adjust timezone as needed)
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - dev
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU for cross-platform builds  
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate version info
+        run: |
+          echo "📋 Generating version information..."
+          make version
+          cat frigate/version.py
+
+      - name: Build ARM64 using custom buildx command
+        run: |
+          echo "🔨 Building Frigate for ARM64..."
+          
+          # Build for ARM64 with --load to make it available in local Docker
+          docker buildx build \
+            --target=frigate \
+            --file docker/main/Dockerfile \
+            --platform linux/arm64 \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-latest \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ github.sha }} \
+            --load \
+            .
+          
+          echo "✅ Images built and loaded:"
+          docker images | grep bkintanar/frigate
+
+      - name: Push Docker images
+        run: |
+          echo "📤 Pushing images to registry..."
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-latest  
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ github.sha }}
+
+      - name: Update deployment file
+        if: github.ref == 'refs/heads/dev'
+        run: |
+          # Create a simple deployment update script
+          cat > update_deployment.sh << 'EOF'
+          #!/bin/bash
+          echo "Latest nightly build available:"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly"
+          echo "SHA: ${{ github.sha }}"
+          echo "Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo ""
+          echo "To update your docker-compose.yml:"
+          echo "Change 'image: frigate:latest' to:"
+          echo "image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly"
+          EOF
+          chmod +x update_deployment.sh
+          ./update_deployment.sh
+
+      - name: Create/Update Release
+        if: github.event_name == 'schedule' && false  # Disabled - remove "&& false" to enable
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: nightly-${{ github.run_number }}
+          name: Nightly Build - ${{ github.run_number }}
+          body: |
+            🌙 **Nightly Build** - Built from `dev` branch
+            
+            **Docker Image**: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly`
+            
+            **Changes since last build**:
+            ${{ github.event.head_commit.message }}
+            
+            **Built for platforms**: `linux/arm64` (optimized for Apple Silicon)
+            
+            **Built using**: `make arm64` (Frigate's official ARM64 build)
+            
+            **Usage**:
+            ```yaml
+            services:
+              frigate:
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
+                # ... rest of your config
+            ```
+            
+            **SHA**: `${{ github.sha }}`
+          prerelease: true
+          generate_release_notes: false
+
+  notify-build-status:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify on failure
+        if: needs.build-and-push.result == 'failure'
+        run: |
+          echo "❌ Nightly build failed!"
+          echo "Check the logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Notify on success  
+        if: needs.build-and-push.result == 'success'
+        run: |
+          echo "✅ Nightly build completed successfully!"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly"
